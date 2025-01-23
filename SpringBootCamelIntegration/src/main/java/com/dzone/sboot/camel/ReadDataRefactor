@@ -1,0 +1,240 @@
+package com.axp.microdose.commercial.demographic.data.verticles
+
+import com.axp.logging.schema.v0_1.Structured
+import com.axp.microdose.commercial.demographic.data.constants.FunctionConstants.*
+import com.axp.microdose.commercial.demographic.data.enums.ErrorEnum
+import com.axp.microdose.commercial.demographic.data.enums.NonSensitiveDataFieldEnum
+import com.axp.microdose.commercial.demographic.data.model.*
+import com.axp.microdose.commercial.demographic.data.model.c360.read.ReadCustomerIdentityAndRelationshipResponse
+import com.axp.microdose.commercial.demographic.data.utils.C360FunctionUtil.buildReadC360Request
+import com.axp.microdose.commercial.demographic.data.validators.RequestValidator
+import com.axp.microdose.commons.MicrodoseConstants
+import com.axp.microdose.commons.MicrodoseConstants.TRACE_LOG_MESSAGE
+import com.axp.microdose.commons.tracing.TracerUtil
+import io.opentracing.Span
+import io.vertx.core.MultiMap
+import io.vertx.core.eventbus.Message
+import io.vertx.core.json.JsonArray
+import io.vertx.core.json.JsonObject
+import org.apache.http.HttpStatus
+import java.time.LocalDate
+import java.time.Period
+import java.time.format.DateTimeFormatter
+
+class ReadCommercialDemographicDataVerticle : BaseVerticle() {
+
+    override suspend fun handle(message: Message<JsonObject>, messageMarker: Structured) {
+        val eventSpan = TracerUtil.createAndStartSpan(getFunctionAddress(), message.headers())
+
+        runCatching {
+            val requestBody = message.body()
+            val requestHeaders = message.headers()
+            val authConfig = getLambdaConfig().getJsonObject(A2A_CONFIG)
+
+            logger.info(messageMarker, "Received request: {}, {}", requestBody, requestHeaders)
+
+            val (request, errors) = RequestValidator.validateReadDataRequest(requestBody, requestHeaders, messageMarker)
+            if (request == null || errors.isNotEmpty()) {
+                sendErrorResponse(message, HttpStatus.SC_BAD_REQUEST, CODE_400, errors, eventSpan)
+                return
+            }
+
+            prepareAccountObjectIfNeeded(request)
+
+            val scopes = extractScopes(authConfig)
+            val readSorResponse = fetchSORData(message, messageMarker, scopes, request)
+            handleSORResponse(readSorResponse, request, message, messageMarker, scopes, eventSpan)
+
+        }.onFailure { exception ->
+            handleException(message, messageMarker, eventSpan, exception)
+        }
+    }
+
+    private fun prepareAccountObjectIfNeeded(request: ReadCommercialDemographicDataRequest) {
+        if (request.account == null && request.accountToken != null) {
+            request.account = Account(request.accountToken!!, CM15)
+        }
+    }
+
+    private fun extractScopes(authConfig: JsonObject): List<String> =
+        authConfig.getJsonArray(SCOPES)?.map { it.toString() } ?: emptyList()
+
+    private fun fetchSORData(
+        message: Message<JsonObject>,
+        messageMarker: Structured,
+        scopes: List<String>,
+        request: ReadCommercialDemographicDataRequest
+    ) = callOneDataFunction(
+        getDependentAddress(READ_SOR_FILE),
+        createA2AHeaders(message.headers(), messageMarker, scopes),
+        JsonObject(gson.toJson(request)),
+        messageMarker
+    )
+
+    private fun handleSORResponse(
+        response: Response,
+        request: ReadCommercialDemographicDataRequest,
+        message: Message<JsonObject>,
+        messageMarker: Structured,
+        scopes: List<String>,
+        eventSpan: Span
+    ) {
+        when (response.headers[MicrodoseConstants.HTTP_STATUS_CODE].toInt()) {
+            HttpStatus.SC_OK -> handleSuccessfulSORResponse(response, request, message, messageMarker, scopes, eventSpan)
+            HttpStatus.SC_NO_CONTENT -> sendEmptyResponse(message, eventSpan)
+            else -> handleSORFailure(response, message, messageMarker, eventSpan)
+        }
+    }
+
+    private fun handleSuccessfulSORResponse(
+        response: Response,
+        request: ReadCommercialDemographicDataRequest,
+        message: Message<JsonObject>,
+        messageMarker: Structured,
+        scopes: List<String>,
+        eventSpan: Span
+    ) {
+        val sorResponseBody = gson.fromJson(response.body.toString(), ReadCommercialDemographicDataSorResponses::class.java)
+        if (sorResponseBody.applications.isNotEmpty()) {
+            val readDataResponse = buildReadSorResponse(sorResponseBody)
+            val missingFields = fetchMissingNSDFieldsFromC360(readDataResponse, message, messageMarker, scopes, eventSpan)
+
+            if (!missingFields.isNullOrEmpty()) {
+                readDataResponse.apply {
+                    isNonSensitiveDataRequired = true
+                    isDataCapturedInLast36Months = false
+                    lastApplication?.missingNonSensitiveFields = missingFields
+                }
+            }
+            sendSuccessResponse(message, HttpStatus.SC_OK, readDataResponse, eventSpan)
+        }
+    }
+
+    private fun fetchMissingNSDFieldsFromC360(
+        response: ReadCommercialDemographicDataResponse?,
+        message: Message<JsonObject>,
+        messageMarker: Structured,
+        scopes: List<String>,
+        eventSpan: Span
+    ): List<String>? {
+        val accountId = response?.lastApplication?.account?.id ?: return null
+        val accountType = response.lastApplication?.account?.type ?: return null
+
+        val c360Response = callOneDataFunction(
+            getDependentAddress(READ_C360),
+            createA2AHeaders(message.headers(), messageMarker, scopes),
+            JsonObject(gson.toJson(buildReadC360Request(accountId, accountType))),
+            messageMarker
+        )
+        eventSpan.setTag(TRACE_LOG_MESSAGE, "Read C360 Call is finished")
+
+        if (c360Response.body == null) {
+            logger.error(messageMarker, "No relationships found for AccountId: {}", accountId)
+            sendErrorResponse(message, HttpStatus.SC_BAD_REQUEST, CODE_400, ErrorEnum.INVALID_ACCOUNT_ID.errorMessage, eventSpan)
+            return null
+        }
+
+        return parseC360ResponseForMissingFields(c360Response)
+    }
+
+    private fun parseC360ResponseForMissingFields(c360Response: Response): List<String> {
+        val missingFields = mutableListOf<String>()
+        val readC360Response = gson.fromJson(c360Response.body.toString(), ReadCustomerIdentityAndRelationshipResponse::class.java)
+
+        readC360Response.relationshipsForAccount?.forEach { relationship ->
+            val contactProfile = relationship.contactProfile
+            val businessInfo = relationship.identityProfile?.businessInformation
+
+            if (contactProfile?.postalAddresses?.business == null) {
+                missingFields.add(NonSensitiveDataFieldEnum.ADDRESS.name)
+            }
+            if (businessInfo?.numberOfBusinessEmployees?.numberOfEmployees == null) {
+                missingFields.add(NonSensitiveDataFieldEnum.NUMBER_OF_WORKERS.name)
+            }
+            if (businessInfo?.standardIndustryCode?.standardIndustryCodeOther?.none { it.type == NAICS_CODE_TYPE } != false) {
+                missingFields.add(NonSensitiveDataFieldEnum.NAICS_CODE.name)
+            }
+            if (businessInfo?.timeInBusiness == null) {
+                missingFields.add(NonSensitiveDataFieldEnum.TIME_IN_BUSINESS.name)
+            }
+        }
+
+        return missingFields
+    }
+
+    private fun buildReadSorResponse(sorResponses: ReadCommercialDemographicDataSorResponses): ReadCommercialDemographicDataResponse {
+        val collectedDate = LocalDate.parse(sorResponses.applications[0].collectionDate, DateTimeFormatter.ISO_DATE)
+        val isSensitiveDataRequired = shouldRequestSensitiveData(collectedDate, sorResponses.applications[0])
+
+        val lastApplication = sorResponses.applications[0].let {
+            LastApplication(
+                it.applicationId,
+                it.referenceNumber,
+                it.requestId,
+                it.entity,
+                it.companyName,
+                it.collectionDate,
+                it.account
+            )
+        }
+
+        return ReadCommercialDemographicDataResponse(
+            isDataCapturedInLast36Months = !isSensitiveDataRequired,
+            isSensitiveDataRequired = isSensitiveDataRequired,
+            isNonSensitiveDataRequired = false,
+            lastApplication = lastApplication
+        )
+    }
+
+    private fun shouldRequestSensitiveData(collectedDate: LocalDate, application: ReadCommercialDemographicDataSorResponse): Boolean {
+        val monthsSinceCollected = Period.between(collectedDate, LocalDate.now()).toTotalMonths()
+        return monthsSinceCollected > 36 || application.businessOwnershipStatus == null && application.principalOwners == null
+    }
+
+    private fun sendErrorResponse(
+        message: Message<JsonObject>,
+        statusCode: Int,
+        errorCode: String,
+        errorMessage: Any?,
+        eventSpan: Span
+    ) {
+        message.reply(JsonObject(mapOf("statusCode" to statusCode, "error" to errorCode, "message" to errorMessage)))
+        eventSpan.finish()
+    }
+
+    private fun sendSuccessResponse(
+        message: Message<JsonObject>,
+        statusCode: Int,
+        response: Any,
+        eventSpan: Span
+    ) {
+        message.reply(JsonObject.mapFrom(response))
+        eventSpan.finish()
+    }
+
+    private fun sendEmptyResponse(message: Message<JsonObject>, eventSpan: Span) {
+        val response = ReadCommercialDemographicDataResponse(
+            isDataCapturedInLast36Months = false,
+            isSensitiveDataRequired = true,
+            isNonSensitiveDataRequired = true
+        )
+        sendSuccessResponse(message, HttpStatus.SC_OK, response, eventSpan)
+    }
+
+    private fun handleException(
+        message: Message<JsonObject>,
+        messageMarker: Structured,
+        eventSpan: Span,
+        exception: Throwable
+    ) {
+        logger.error(messageMarker, "Request failed with exception: {}", exception)
+        TracerUtil.finishSpanWithFailure(eventSpan, exception)
+        sendErrorResponse(message, HttpStatus.SC_INTERNAL_SERVER_ERROR, CODE_400, exception.message, eventSpan)
+    }
+
+    private fun handleSORFailure(response: Response, message: Message<JsonObject>, messageMarker: Structured, eventSpan: Span) {
+        val errorResponse = gson.fromJson(response.body.toString(), ErrorResponse::class.java)
+        logger.info(messageMarker, "Read Demographic Data SOR failed: {}", errorResponse)
+        sendErrorResponse(message, response.headers[MicrodoseConstants.HTTP_STATUS_CODE].toInt(), CODE_400, errorResponse, eventSpan)
+    }
+}
