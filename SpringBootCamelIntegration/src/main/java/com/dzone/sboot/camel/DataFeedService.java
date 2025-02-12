@@ -19,7 +19,6 @@ import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.ResourceLoaderAware;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.stereotype.Service;
@@ -30,7 +29,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 @Service
-public class DataFeedService implements ResourceLoaderAware {
+public class DataFeedService {
   private static final Logger log = LoggerFactory.getLogger(DataFeedTrigger.class);
   private static final String DEMOGRAPHIC_TEMPLATE_PATH = "classpath:templates/Demographic_Data_Feed_Template.xls";
   private static final String EMAIL_TEMPLATE_PATH = "classpath:templates/Email_Data_Feed_Template.xls";
@@ -38,20 +37,16 @@ public class DataFeedService implements ResourceLoaderAware {
   private final EmailRequestRepository emailRequestRepository;
   private final HiPEDUtil hiPEDUtil;
   private final ObjectMapper mapper;
-  private ResourceLoader resourceLoader;
+  private final ResourceLoader resourceLoader;
 
   public DataFeedService(DemographicDetailRepository demographicDetailRepository,
                          EmailRequestRepository emailRequestRepository,
-                         HiPEDUtil hiPEDUtil) {
+                         HiPEDUtil hiPEDUtil, ResourceLoader resourceLoader) {
     this.demographicDetailRepository = demographicDetailRepository;
     this.emailRequestRepository = emailRequestRepository;
     this.hiPEDUtil = hiPEDUtil;
-    this.mapper = new ObjectMapper();
-  }
-
-  @Override
-  public void setResourceLoader(ResourceLoader resourceLoader) {
     this.resourceLoader = resourceLoader;
+    this.mapper = new ObjectMapper();
   }
 
   public void generateDemographicDataFile() {
@@ -84,11 +79,11 @@ public class DataFeedService implements ResourceLoaderAware {
       setDemographicRowData(row, demographicDetailEntity);
       demographicDetailEntity.setLastUpdateTimestamp(LocalDateTime.now());
       demographicDetailEntity.setSentToBigDataIndicator(true);
-      demographicDetailRepository.save(demographicDetailEntity);
+//      demographicDetailRepository.save(demographicDetailEntity);
     }
   }
 
-  private void setDemographicRowData(Row row, DemographicDetailEntity demographicDetail) {
+  public void setDemographicRowData(Row row, DemographicDetailEntity demographicDetail) {
     try {
       row.createCell(0).setCellValue(String.valueOf(demographicDetail.getApplicationIdentifier()));
       row.createCell(1).setCellValue(demographicDetail.getReferenceNumber());
@@ -167,7 +162,7 @@ public class DataFeedService implements ResourceLoaderAware {
     }
   }
 
-  private void setPrincipalOwnerData(Row row, PrincipalOwners owner, int index) {
+  public void setPrincipalOwnerData(Row row, PrincipalOwners owner, int index) {
     int baseCell = 16 + index * 9;
     row.createCell(baseCell).setCellValue(FeedServiceUtil.getPrincipalOwnerEthnicity(owner));
     row.createCell(baseCell + 1).setCellValue(FeedServiceUtil.getPrincipalOwnerEthnicityFreeFormText(owner));
@@ -192,18 +187,18 @@ public class DataFeedService implements ResourceLoaderAware {
     row.createCell(65).setCellValue(address.getAlphaCountryCode());
   }
 
-  private void populateEmailSheet(Sheet sheet, List<EmailRequestEntity> emailRequests) {
+  public void populateEmailSheet(Sheet sheet, List<EmailRequestEntity> emailRequests) {
     int rowIndex = 1;
     for (EmailRequestEntity emailRequestEntity : emailRequests) {
       Row row = sheet.createRow(rowIndex++);
       setEmailRowData(row, emailRequestEntity);
       emailRequestEntity.setLastUpdateTimestamp(LocalDateTime.now());
       emailRequestEntity.setSentToBigDataIndicator(true);
-      emailRequestRepository.save(emailRequestEntity);
+//      emailRequestRepository.save(emailRequestEntity);
     }
   }
 
-  private void setEmailRowData(Row row, EmailRequestEntity emailData) {
+  public void setEmailRowData(Row row, EmailRequestEntity emailData) {
     try {
       row.createCell(0).setCellValue(String.valueOf(emailData.getEmailRequestIdentifier()));
       row.createCell(1).setCellValue(emailData.getEmailTrackingIdentifier());
@@ -245,12 +240,12 @@ public class DataFeedService implements ResourceLoaderAware {
     }
   }
 
-  private POIFSFileSystem createWorkBookTemplate(String templatePath) throws IOException {
+  public POIFSFileSystem createWorkBookTemplate(String templatePath) throws IOException {
     Resource resource = resourceLoader.getResource(templatePath);
     return new POIFSFileSystem(resource.getInputStream());
   }
 
-  private void saveWorkbookToFile(HSSFWorkbook workbook, String fileName) throws IOException {
+  public void saveWorkbookToFile(HSSFWorkbook workbook, String fileName) throws IOException {
     try (FileOutputStream fileOutputStream = new FileOutputStream(fileName)) {
       workbook.write(fileOutputStream);
     }
