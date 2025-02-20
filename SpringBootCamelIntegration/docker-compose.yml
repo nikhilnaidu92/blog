@@ -1,0 +1,99 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-enterprise-kafka:latest
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093
+      KAFKA_BROKER_ID: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9991
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+    ports:
+      - 9093:9093
+
+  debezium-connect:
+    image: debezium/connect:latest
+    container_name: debezium-connect
+    depends_on:
+      - kafka
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:9093"
+      GROUP_ID: "debezium-connect"
+      CONFIG_STORAGE_TOPIC: "connect-configs"
+      OFFSET_STORAGE_TOPIC: "connect-offsets"
+      STATUS_STORAGE_TOPIC: "connect-status"
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./src/main/resources/lib/jcc-11.5.8.0.jar:/kafka/connect/debezium-connector-db2/jcc-11.5.8.0.jar
+
+  db2:
+    build:
+      context: .
+      dockerfile: Dockerfile-db2
+      args:
+        - DB2_VERSION=11.5.0.0
+        - DB_SCRIPTS_DIR=/db2/scripts/
+    container_name: db2
+    environment:
+      - LICENSE=accept
+      - DB2INSTANCE=db2inst1
+      - DB2INST1_PASSWORD=db2inst1_password
+      - DBNAME=MYDB
+      - IS_OSXFS=true
+      - PERSISTENT_HOME=true
+      - TO_CREATE_SAMPLEDB=true
+      - REPODB=false
+    ports:
+      - "50000:50000"
+    healthcheck:
+      test: [ "CMD", "bash", "-c", "su - db2inst1 -c 'db2 connect to MYDB'" ]
+      interval: 30s
+      timeout: 30s
+      retries: 10
+    privileged: true
+
+  postgres:
+    image: postgres:latest
+    container_name: postgres
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_HOST: localhost
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydatabase
+    volumes:
+      - ./src/main/resources/conf/:/var/lib/postgresql/data/
+
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:latest
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:9093
+      CONNECT_REST_PORT: 8084
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_GROUP_ID: "connect-group"
+      CONNECT_CONFIG_STORAGE_TOPIC: "connect-configs"
+      CONNECT_OFFSET_STORAGE_TOPIC: "connect-offsets"
+      CONNECT_STATUS_STORAGE_TOPIC: "connect-status"
+      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_PLUGIN_PATH: "/usr/share/java"
+    ports:
+      - "8084:8083"
