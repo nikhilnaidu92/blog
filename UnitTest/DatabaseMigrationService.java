@@ -1,6 +1,8 @@
 package com.aexp.gcs.supplierprofile.scriptsupport.service;
 
+import com.aexp.bta.onexp.domain.FeatureFlag;
 import com.aexp.bta.onexp.service.FeatureFlagService;
+import com.aexp.bta.onexp.service.FeatureToggles;
 import com.aexp.gcs.supplierprofile.profilecommons.repository.app.ProfileAcceptanceRepository;
 import com.aexp.gcs.supplierprofile.profilecommons.repository.app.ProfileCompanyDetailRepository;
 import com.aexp.gcs.supplierprofile.profilecommons.repository.app.ProfileCompanyRepository;
@@ -13,10 +15,14 @@ import com.aexp.gcs.supplierprofile.profilecommons.repository.app.ProfileReposit
 import com.aexp.gcs.supplierprofile.profilecommons.util.CouchbasejsonUtils;
 import com.aexp.gcs.supplierprofile.profilecommons.util.EncryptDecryptUtil;
 import com.aexp.gcs.supplierprofile.profilecommons.util.OneSupplierLogFacade;
+import com.aexp.gcs.supplierprofile.profilecommons.util.ProfileCommonUtil;
 import com.aexp.gcs.supplierprofile.profiledatamodel.constants.Action;
+import com.aexp.gcs.supplierprofile.profiledatamodel.constants.ActorSystem;
+import com.aexp.gcs.supplierprofile.profiledatamodel.constants.BusinessType;
 import com.aexp.gcs.supplierprofile.profiledatamodel.constants.CompanySource;
+import com.aexp.gcs.supplierprofile.profiledatamodel.constants.CouchbaseDocumentType;
 import com.aexp.gcs.supplierprofile.profiledatamodel.constants.EventType;
-import com.aexp.gcs.supplierprofile.profiledatamodel.constants.SPFIdType;
+import com.aexp.gcs.supplierprofile.profiledatamodel.constants.OnboardingStatus;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.database.entity.Profile;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.database.entity.ProfileAcceptance;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.database.entity.ProfileCompany;
@@ -26,36 +32,56 @@ import com.aexp.gcs.supplierprofile.profiledatamodel.domain.database.entity.Prof
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.database.entity.ProfileEvent;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.database.entity.ProfilePaymentAccount;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.database.entity.ProfileRelationship;
+import com.aexp.gcs.supplierprofile.profiledatamodel.domain.db.AcceptanceDetail;
+import com.aexp.gcs.supplierprofile.profiledatamodel.domain.db.AcceptanceType;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.db.CompanyAlias;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.db.CompanyDetails;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.db.CompanyProfile;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.db.CompanyProfileEvent;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.Event;
+import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.Acceptance;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.CompanyContact;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.CompanyId;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.Contact;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.ContactDestination;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.CounterpartyDetails;
+import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.CounterpartyId;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.Demographics;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.GenericContact;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.Location;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.PaymentAccount;
-import com.aexp.gcs.supplierprofile.scriptsupport.exception.AssertionValidationException;
+import com.aexp.gcs.supplierprofile.scriptsupport.model.BatchParameter;
+import com.aexp.gcs.supplierprofile.scriptsupport.model.FeatureFlagConstants;
 import com.aexp.gcs.supplierprofile.scriptsupport.model.MigrationResult;
 import com.aexp.gcs.supplierprofile.scriptsupport.model.QueuedDocs;
 import com.aexp.gcs.supplierprofile.scriptsupport.repository.CouchbaseRepo;
+import com.aexp.gcs.supplierprofile.scriptsupport.repository.RedisRepository;
 import com.aexp.gcs.supplierprofile.scriptsupport.util.BatchProcessUtil;
+import com.couchbase.client.java.json.JsonArray;
+import com.couchbase.client.java.json.JsonObject;
+import com.couchbase.client.java.query.QueryResult;
+import jakarta.persistence.PersistenceException;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.apache.commons.collections4.CollectionUtils;
 import org.springframework.beans.BeanUtils;
 import org.springframework.core.env.Environment;
+import org.springframework.dao.DataAccessException;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -64,11 +90,18 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
-import static com.aexp.gcs.supplierprofile.scriptsupport.constants.ScriptSupportConstants.CM11_TYPE;
-import static com.aexp.gcs.supplierprofile.scriptsupport.constants.ScriptSupportConstants.CM15_TYPE;
+import static com.aexp.gcs.supplierprofile.profilecommons.util.ProfileCommonUtil.createAliasDocName;
+import static com.aexp.gcs.supplierprofile.profilecommons.util.ProfileCommonUtil.findByIdAndSource;
+import static com.aexp.gcs.supplierprofile.profiledatamodel.constants.CouchbaseDocumentType.company_alias;
+import static com.aexp.gcs.supplierprofile.profiledatamodel.constants.CouchbaseDocumentType.company_profile;
+import static com.aexp.gcs.supplierprofile.profiledatamodel.constants.SPFIdType.PROFILE_CORRELATION_ID;
+import static com.aexp.gcs.supplierprofile.scriptsupport.model.Constants.CM11_TYPE;
+import static com.aexp.gcs.supplierprofile.scriptsupport.model.Constants.CM15_TYPE;
 import static java.util.Objects.isNull;
 import static java.util.Objects.nonNull;
+import static org.apache.commons.collections4.IterableUtils.isEmpty;
 
 @Data
 @Service
@@ -89,6 +122,7 @@ public class DatabaseMigrationService {
   private final MigratedDocumentValidationService migratedDocumentValidationService;
   private final BatchProcessUtil batchProcessUtil;
   private final FeatureFlagService featureFlagService;
+  private final RedisRepository redisRepository;
   private String className = this.getClass().getSimpleName();
   private String appName = "PostgresMigrationBatch";
 
@@ -99,32 +133,28 @@ public class DatabaseMigrationService {
     String errorMessage;
     String profileCorrelationId = null;
     boolean status = false;
-    for (String profileId : profileIds) {
-      try {
+    try {
+      for (String profileId : profileIds) {
         profileCorrelationId = profileId;
         MigrationResult migrationResult = couchbaseRepo.getProfileDocumentById(profileId);
+        OneSupplierLogFacade.info(appName, UUID.fromString(profileId), correlationId, className, methodName,
+          "Processing data insertion for profileId:" + profileId);
         if (migrationResult != null) {
           validateAndInsert(migrationResult, profileId, correlationId);
-          try {
-            migratedDocumentValidationService.validateMigratedDocuments(UUID.fromString(profileId));
-          } catch (AssertionValidationException ex) {
-            errorMessage = "Failed to assert document id:" + profileId + " but proceeding with ingestion.";
-            OneSupplierLogFacade.error(appName, UUID.fromString(profileId), correlationId, className, methodName,
-              errorMessage, ex);
-          }
           couchbaseRepo.updateDocumentStatus(profileId);
           status = true;
         }
-      } catch (Exception ex) {
-        errorMessage = "Failed to migrate document:" + profileCorrelationId;
-        OneSupplierLogFacade.error(appName, UUID.fromString(profileCorrelationId), correlationId, className,
-          methodName, errorMessage, ex);
       }
+    } catch (Exception ex) {
+      errorMessage = "Failed to migrate document:" + profileCorrelationId + ", due to "
+        + OneSupplierLogFacade.getCompleteTrace(ex);
+      redisRepository.upsertFailedMigrationDocIdWithError(String.valueOf(profileCorrelationId), errorMessage);
+      OneSupplierLogFacade.error(appName, UUID.fromString(profileCorrelationId), correlationId, className,
+        methodName, errorMessage, ex);
     }
     return status;
   }
 
-  @Transactional
   public void migrateQueuedDocuments(String queuedId) {
     QueuedDocs queuedDocs = couchbaseRepo.getQueuedDocsById(queuedId);
     queuedDocs.getInQueueEvents().forEach(event ->
@@ -149,46 +179,132 @@ public class DatabaseMigrationService {
     }
   }
 
-  @Transactional(rollbackFor = Exception.class, noRollbackFor = AssertionValidationException.class)
-  public void migrateDocuments(int limit, int offset) {
+  public void migrateDocuments() throws UnknownHostException {
+    String methodName = "migrateDocuments";
+    String correlationId = UUID.randomUUID().toString();
+    OneSupplierLogFacade.info(appName, null, correlationId, className, methodName,
+      methodName + "called to migrate data");
+    FeatureFlag dbMigrationFeatureFlag = FeatureToggles.get(FeatureFlagConstants.DB_MIGRATION);
+    OneSupplierLogFacade.info(appName, null, correlationId, className, methodName,
+      "Flag value for dbMigrationFeatureFlag is: " + dbMigrationFeatureFlag.getProperties().get("script-center"));
+    boolean isDbMigrationActive = dbMigrationFeatureFlag.isEnabled()
+      && Boolean.parseBoolean(dbMigrationFeatureFlag.getProperties().get("script-center").get());
+    OneSupplierLogFacade.info(appName, null, correlationId, className, methodName,
+      "Flag value for db migration is: " + isDbMigrationActive);
+    if (Boolean.parseBoolean(environment.getProperty("isMigrationScriptEnabled"))) {
+      String hostName = InetAddress.getLocalHost().getHostName();
+      OneSupplierLogFacade.info(appName, null, correlationId, className, methodName,
+        methodName + "called to migrate data for host" + hostName);
+      BatchParameter batchParameterDetails = batchProcessUtil.getBatchForDataMigrationPerPod(hostName);
+      int limit = 100;
+      int offset;
+      OneSupplierLogFacade.info(appName, null, correlationId, className, methodName,
+        "Start time for script center pod: " + hostName + " is " + LocalDateTime.now());
+      int count = batchParameterDetails.getBatchUpperLimit();
+      OneSupplierLogFacade.info(appName, null, correlationId, className, methodName,
+        "Total records of 36 char length to migrate by script center pod" + hostName + " is " + count);
+      AtomicInteger processed = new AtomicInteger();
+      for (offset = batchParameterDetails.getOffset(); offset < count; offset += limit) {
+        if (offset + limit > count) {
+          limit = count - offset;
+        }
+        try {
+          List<String> profileIds = couchbaseRepo.loadProfileIds(limit, offset);
+          if (profileIds == null || profileIds.isEmpty()) {
+            break;
+          }
+          migrateDocuments(profileIds, processed);
+        } catch (Exception ex) {
+          OneSupplierLogFacade.error(appName, null, correlationId, className, methodName,
+            "error loading profile from Couchbase", ex);
+        }
+      }
+      OneSupplierLogFacade.info(appName, null, correlationId, className, methodName,
+        "Total profiles migrated by script center pod" + hostName + " is " + processed);
+      OneSupplierLogFacade.info(appName, null, correlationId, className, methodName,
+        "End time for script center pod:" + hostName + " is " + LocalDateTime.now());
+    }
+  }
+
+  public void migrateDocuments(List<String> profileIds, AtomicInteger processed) {
     String errorMessage;
     String methodName = "migrateDocuments";
     String correlationId = "batch-";
     UUID profileId = null;
-    AtomicInteger processed = new AtomicInteger();
-    List<String> profileIds = couchbaseRepo.loadProfileIds(limit, offset);
     for (String id : profileIds) {
       try {
         MigrationResult profile = couchbaseRepo.getProfileDocumentById(id);
         if (nonNull(profile.getBusinessProfile())
-          && !"migrated-09".equals(profile.getBusinessProfile().getDocumentStatus())) {
+          && !"migrated-11".equals(profile.getBusinessProfile().getDocumentStatus())) {
           profileId = UUID.fromString(id);
           correlationId = "batch-" + UUID.randomUUID();
-          validateAndInsert(profile, String.valueOf(UUID.fromString(profile.getId())), correlationId);
+          validateAndInsert(profile, String.valueOf(UUID.fromString(profile.getId())),
+            correlationId);
           OneSupplierLogFacade.info(appName, profileId, correlationId, className, methodName,
             "Successfully migrated Profile ID:" + profileId);
-          try {
-            migratedDocumentValidationService.validateMigratedDocuments(profileId);
-          } catch (AssertionValidationException ex) {
-            errorMessage = "Failed to assert document id:" + profileId + " but proceeding with ingestion.";
-            OneSupplierLogFacade.error(appName, profileId, correlationId, className, methodName, errorMessage, ex);
-          }
-          couchbaseRepo.updateDocumentStatus(profileId.toString());
           processed.getAndIncrement();
         }
       } catch (Exception ex) {
-        errorMessage = "Failed to migrate document:" + profileId;
+        errorMessage = "Failed to migrate document:" + profileId
+          + ", due to " + OneSupplierLogFacade.getCompleteTrace(ex);
         OneSupplierLogFacade.error(appName, profileId, correlationId, className, methodName, errorMessage, ex);
       }
     }
+    OneSupplierLogFacade.info(appName, profileId, correlationId, className, methodName,
+      "Total processed profiles: " + processed);
   }
 
-  public void validateAndInsert(MigrationResult migrationResult, String id, String correlationId) {
+  @Transactional
+  public List<UUID> migrateDocumentsScheduler() {
+    String errorMessage;
+    String methodName = "migrateDocuments";
+    String correlationId = "batch-" + UUID.randomUUID();
+    QueryResult queryResult = couchbaseRepo.profileCount();
+    int size = queryResult.rowsAs(Integer.class).get(0);
+    int limit = 100;
+    int offset = Integer.parseInt(redisRepository.getOffsetValue());
+    UUID profileId = null;
+    List<UUID> profileIds = new ArrayList<>();
+    if (offset <= size) {
+      try {
+        List<MigrationResult> profileList = couchbaseRepo
+          .getDocumentsByLimitAndOffset(limit, offset)
+          .stream()
+          .filter(profile -> !"migrated-11".equals(profile.getBusinessProfile().getDocumentStatus()))
+          .toList();
+        Set<MigrationResult> uniqueValues = new HashSet<>();
+        if (!profileList.isEmpty()) {
+          profileIds = profileList.stream().filter(uniqueValues::add)
+            .map(result -> UUID.fromString(result.getId())).collect(Collectors.toList());
+          offset += limit;
+          for (MigrationResult migrationResult : profileList) {
+            profileId = UUID.fromString(migrationResult.getId());
+            validateAndInsert(migrationResult, String.valueOf(profileId), correlationId);
+            OneSupplierLogFacade.info(appName, profileId, correlationId, className, methodName,
+              "Successfully migrated Profile ID:" + profileId + " for offset:" + offset);
+          }
+        }
+      } catch (Exception ex) {
+        errorMessage = "Failed to migrate document:" + profileId
+          + ", for Offset: " + offset + ", due to " + OneSupplierLogFacade.getCompleteTrace(ex);
+        redisRepository.upsertFailedMigrationDocIdWithError(String.valueOf(profileId), errorMessage);
+        OneSupplierLogFacade.error(appName, profileId, correlationId, className, methodName, errorMessage, ex);
+      } finally {
+        redisRepository.upsertOffsetValue(String.valueOf(offset));
+      }
+    }
+    return profileIds;
+  }
+
+  @Transactional(rollbackFor = Exception.class)
+  @Retryable(retryFor = {DataAccessException.class, PersistenceException.class, TransactionException.class,
+    CannotCreateTransactionException.class}, maxAttempts = 3, backoff = @Backoff(delay = 2000, multiplier = 2))
+  public void validateAndInsert(MigrationResult migrationResult, String id, String trackingCorrelationId) {
     String methodName = "validateAndInsert";
     UUID profileId = UUID.fromString(id);
     if (migrationResult != null && migrationResult.getBusinessProfile() != null
       && migrationResult.getBusinessProfile().getCompanyProfile() != null) {
-      OneSupplierLogFacade.info(appName, profileId, correlationId, className, methodName,
+      OneSupplierLogFacade.info(appName, profileId, trackingCorrelationId, className, methodName,
         "Processing data insertion for profileId:" + profileId);
       CompanyProfile companyProfile = migrationResult.getBusinessProfile().getCompanyProfile();
       CompanyProfileEvent companyProfileEvent = migrationResult.getBusinessProfile().getCompanyProfileEvent();
@@ -197,20 +313,247 @@ public class DatabaseMigrationService {
       Map<String, CompanyDetails> companyDetailsMap = companyProfile.getCompanyDetails();
       List<CompanyId> correlatedCompanyIds = getCompanyIDListOfTypeProfileCorrelationId(companyIdList);
       String profileCreateTimestamp = companyProfile.getUpdateTime();
-      insertDocuments(companyProfile, profileId, correlationId, companyProfileEvent,
+      insertDocuments(companyProfile, profileId, trackingCorrelationId, companyProfileEvent,
         companyDetailsMap, correlatedCompanyIds, profileCreateTimestamp);
+      migratedDocumentValidationService.validateMigratedDocuments(profileId);
+      couchbaseRepo.updateDocumentStatus(profileId.toString());
     } else {
-      if (migrationResult != null && migrationResult.getBusinessProfile() != null
+      boolean isEventsNotEmpty = migrationResult != null && migrationResult.getBusinessProfile() != null
         && nonNull(migrationResult.getBusinessProfile().getCompanyProfileEvent())
-        && !migrationResult.getBusinessProfile().getCompanyProfileEvent().getEvents().isEmpty()
+        && !migrationResult.getBusinessProfile().getCompanyProfileEvent().getEvents().isEmpty();
+
+      if (isEventsNotEmpty && migrationResult.getBusinessProfile().getCompanyProfileEvent().getEvents().size() > 1) {
+        // (1) Get correlation ids from events
+        Set<CompanyId> correlationCompanyIdSet =
+          migrationResult.getBusinessProfile().getCompanyProfileEvent().getEvents().stream()
+            .map(event -> event.getCompanyId().stream()
+              .filter(companyId -> companyId.getType()
+                .equals(PROFILE_CORRELATION_ID.getIdType()))
+              .findFirst().orElse(null))
+            .filter(Objects::nonNull)
+            .collect(Collectors.toSet());
+
+        OneSupplierLogFacade.info(appName, profileId, trackingCorrelationId, className, methodName,
+          "Encountered correlationIds with missing company_profile:" + correlationCompanyIdSet);
+        // (2) Run profile restoration process
+        correlationCompanyIdSet.forEach(this::restoreCompanyProfileSubdocIfMissing);
+        migrateDocumentById(Collections.singletonList(profileId.toString()));
+      } else if (isEventsNotEmpty
         && migrationResult.getBusinessProfile().getCompanyProfileEvent().getEvents().size() == 1) {
-        OneSupplierLogFacade.warn(appName, profileId, correlationId, className, methodName,
+        OneSupplierLogFacade.warn(appName, profileId, trackingCorrelationId, className, methodName,
           "Company profile having event size 1 and is probably de-duped:" + profileId);
       } else {
-        OneSupplierLogFacade.error(appName, profileId, correlationId, className, methodName,
+        OneSupplierLogFacade.error(appName, profileId, trackingCorrelationId, className, methodName,
           "Company profile is empty for profileId:" + profileId);
       }
     }
+  }
+
+  /**
+   * Checks if a given Alias document exists and that its associated Profile document does <em>not</em> have a
+   * company_profile subdocument. This scenario indicates that this profile was incorrectly deduped at some point and
+   * the company_profile erroneously deleted. This method will trigger the restoration of this corrupted profile.
+   *
+   * @param profileCorrelationId profileCorrelationId
+   */
+  protected void restoreCompanyProfileSubdocIfMissing(CompanyId profileCorrelationId) {
+    CompanyAlias companyAlias = getAliasDocument(profileCorrelationId);
+    if (nonNull(companyAlias)) {
+      String profileId = companyAlias.getProfileId();
+      if (!couchbaseRepo.exists(profileId, company_profile)) {
+        restoreMissingCompanyProfileSubdoc(profileId);
+      }
+    }
+  }
+
+  public CompanyAlias getAliasDocument(final CompanyId companyId) {
+    if (companyId != null && couchbaseRepo.exists(createAliasDocName(companyId))) {
+      return getCompanyAlias(createAliasDocName(companyId), company_alias);
+    }
+    return null;
+  }
+
+  public CompanyAlias getCompanyAlias(String aliasDocName, CouchbaseDocumentType couchbaseDocumentType) {
+    return CouchbasejsonUtils
+      .convertJsonToJava(couchbaseRepo.get(aliasDocName, couchbaseDocumentType).toString(),
+        CompanyAlias.class
+      );
+  }
+
+  /**
+   * Method that restores missing company_profile subdoc. The company_profile_event subdoc is retrieved for the
+   * profileId parameter. Iterating through the event list, information is extracted from the events and used to
+   * recreate company_profile. Finally the restored company_profile is upserted.
+   *
+   * @param profileId profileId
+   * @return CompanyProfile
+   */
+  public CompanyProfile restoreMissingCompanyProfileSubdoc(String profileId) {
+    OneSupplierLogFacade.info(appName, UUID.fromString(profileId), null, className,
+      "restoreMissingCompanyProfileSubdoc",
+      "Attempting to restore company_profile from event subdoc for" + profileId);
+    JsonObject companyProfileEventJson = couchbaseRepo.get(profileId, CouchbaseDocumentType.company_profile_event);
+    if (isNull(companyProfileEventJson)) {
+      OneSupplierLogFacade.error(appName, UUID.fromString(profileId), null, className,
+        "restoreMissingCompanyProfileSubdoc",
+        "No company_profile_event found for" + profileId);
+      return null;
+    }
+
+    JsonArray eventList = companyProfileEventJson.getArray("events");
+    if (!isEmpty(eventList)) {
+      // Initialize fields/objects needed for company_profile
+      Map<String, CompanyDetails> companyDetailsMap = new HashMap<>();
+      CounterpartyId counterpartyId = null;
+      List<AcceptanceDetail> acceptance = new ArrayList<>();
+      Demographics c360Demographics = null;
+      List<CompanyId> companyIdList = new ArrayList<>();
+
+      // Iterate through each event in event list and insert/update company_details map and set company_profile fields
+      // using event info
+      for (int index = 0; index < eventList.size(); index++) {
+        JsonObject event = eventList.getObject(index);
+
+        // Get the correlation id from company id list
+        JsonArray companyIdJsonArray = event.getArray("company_id");
+        if (isNull(companyIdJsonArray)) {
+          OneSupplierLogFacade.warn(appName, UUID.fromString(profileId), null, className,
+            "restoreMissingCompanyProfileSubdoc",
+            "Attempting to restore company_profile - continuing to next event because unable to get"
+              + "correlation id from  null company_id");
+          continue;
+        }
+
+        List<CompanyId> companyIds = convertJsonArrayToList(companyIdJsonArray, CompanyId.class);
+
+        ActorSystem actorSystem = ActorSystem
+          .valueOf(event.getObject("envelope").getObject("actor").getString("system"));
+        CompanySource source = ProfileCommonUtil.actorSystemToCompanySource(actorSystem);
+        Optional<CompanyId> correlationIdOptional =
+          findByIdAndSource(companyIds, PROFILE_CORRELATION_ID.getIdType(), source);
+
+        // Initialize default company details to be updated with data from events
+        CompanyDetails companyDetails = new CompanyDetails();
+        companyDetails.setSchemaVersion(2);
+        companyDetails.setCounterpartyCorrelationId(null);
+        companyDetails.setOnboardingStatus(OnboardingStatus.CREATE_INITIATED);
+        companyDetails.setDeleteStatus(false);
+        companyDetails.setBusinessType(null);
+        companyDetails.setContacts(null);
+        companyDetails.setDemographics(null);
+        companyDetails.setPaymentAccounts(null);
+        companyDetails.setCreateTime(LocalDateTime.now().toString());
+
+        if (correlationIdOptional.isPresent()) {
+          String eventCorrelationId = correlationIdOptional.get().getValue();
+          companyDetailsMap.putIfAbsent(eventCorrelationId, companyDetails);
+
+          // Combine ids from previous event and dedupe
+          companyIdList = Stream.concat(companyIdList.stream(), companyIds.stream())
+            .distinct()
+            .collect(Collectors.toList());
+
+          // Get acceptance from event and add to acceptance for company_profile
+          if (nonNull(event.getObject("acceptance"))
+            && EventType.PROFILE_ACCEPTANCE_EVENT.getEventType().equals(event.getString("event_type"))) {
+            Acceptance acceptanceFromEvent = CouchbasejsonUtils
+              .convertJsonToJava(event.getObject("acceptance").toString(), Acceptance.class);
+            acceptance.add(new AcceptanceDetail(
+              nonNull(acceptanceFromEvent.getBuyBusId()) ? AcceptanceType.RELATIONSHIP : AcceptanceType.SUPPLIER,
+              acceptanceFromEvent.getBuyBusId(),
+              acceptanceFromEvent
+            ));
+          }
+
+          // If present, get c360 demographics from event and populate for company_profile
+          if (nonNull(event.getObject("c360demographics"))) {
+            c360Demographics = CouchbasejsonUtils
+              .convertJsonToJava(event.getObject("c360demographics").toString(), Demographics.class);
+          }
+
+          // Get correlation id from notification event and set counterparty_id for company_details in company_profile
+          if (nonNull(event.getObject("counterparty_id"))) {
+            List<CompanyId> counterpartyIdCompanyIdList = convertJsonArrayToList(
+              event.getObject("counterparty_id").getArray("company_id"), CompanyId.class
+            );
+            Optional<CompanyId> counterpartyCorrelationId = findByIdAndSource(counterpartyIdCompanyIdList,
+              PROFILE_CORRELATION_ID.getIdType(), source);
+            counterpartyCorrelationId.ifPresent(companyId -> companyDetailsMap.get(eventCorrelationId)
+              .setCounterpartyCorrelationId(companyId));
+          }
+
+          // Get payment accounts from event and update payment accounts in company details
+          if (!EventType.PROFILE_NOTIFICATION_EVENT.getEventType().equals(event.getString("event_type"))
+            && (nonNull(event.getArray("paymentAccounts")) || nonNull(event.getArray("payment_accounts")))) {
+            JsonArray paymentAccounts = nonNull(event.getArray("paymentAccounts"))
+              ? event.getArray("paymentAccounts")
+              : event.getArray("payment_accounts");
+            List<PaymentAccount> paymentAccountList = convertJsonArrayToList(paymentAccounts, PaymentAccount.class);
+            companyDetailsMap.get(eventCorrelationId).setPaymentAccounts(paymentAccountList);
+          }
+
+          // Get business_type from event and update business_type in company details
+          if (nonNull(event.getString("business_type"))) {
+            companyDetailsMap.get(eventCorrelationId).
+              setBusinessType(BusinessType.valueOf(event.getString("business_type")));
+          }
+
+          // Get contacts from event and update contacts in company details
+          if (nonNull(event.getArray("contacts"))) {
+            List<Contact> contacts = convertJsonArrayToList(event.getArray("contacts"), Contact.class);
+            companyDetailsMap.get(eventCorrelationId).setContacts(contacts);
+          }
+
+          // Get demographics from event and update demographics in company details
+          if (nonNull(event.getObject("demographics"))) {
+            Demographics demographics = CouchbasejsonUtils
+              .convertJsonToJava(event.getObject("demographics").toString(), Demographics.class);
+            companyDetailsMap.get(eventCorrelationId).setDemographics(demographics);
+          }
+        }
+      }
+
+      // Upsert company_profile with populated fields (counterpartyId default to null)
+      CompanyProfile companyProfile = new CompanyProfile();
+      companyProfile.setCompanyId(companyIdList);
+      companyProfile.setDemographics(c360Demographics);
+      companyProfile.setAcceptanceDetails(acceptance.isEmpty() ? null : acceptance);
+      companyProfile.setProfileId(companyProfileEventJson.getString("id"));
+      companyProfile.setCouchbaseDocumentType(company_profile);
+      companyProfile.setCompanyDetails(companyDetailsMap);
+      upsertCompanyProfile(companyProfile.getProfileId(), companyProfile);
+      return companyProfile;
+    }
+    OneSupplierLogFacade.error(appName, UUID.fromString(profileId), null, className,
+      "restoreMissingCompanyProfileSubdoc",
+      "No events stored in couchbase to restore company_profile with");
+    return null;
+  }
+
+  public void upsertCompanyProfile(String profileId, CompanyProfile companyProfile) {
+    companyProfile.setUpdateTime(LocalDateTime.now().toString());
+    couchbaseRepo.upsert(profileId, company_profile,
+      JsonObject.fromJson(CouchbasejsonUtils.convertJavaToJson(companyProfile)),
+      10
+    );
+  }
+
+  /**
+   * Helper method for converting JsonArray to List with null values excluded
+   *
+   * @param jsonArray to be converted
+   * @param cls       class of objects in the returned List
+   * @return converted List
+   */
+  private <T> List<T> convertJsonArrayToList(JsonArray jsonArray, Class<T> cls) {
+    List<T> convertedList = new ArrayList<>();
+    for (int i = 0; i < jsonArray.size(); i++) {
+      JsonObject ele = jsonArray.getObject(i);
+      if (ele != null) {
+        convertedList.add(CouchbasejsonUtils.convertJsonToJava(ele.toString(), cls));
+      }
+    }
+    return convertedList;
   }
 
   public static void filterAndRemoveDuplicateTaxId(List<CompanyId> companyIdList) {
@@ -222,7 +565,7 @@ public class DatabaseMigrationService {
     }
   }
 
-  public void insertDocuments(CompanyProfile companyProfile, UUID profileId, String correlationId,
+  public void insertDocuments(CompanyProfile companyProfile, UUID profileId, String trackingCorrelationId,
                               CompanyProfileEvent companyProfileEvent, Map<String, CompanyDetails> companyDetailsMap,
                               List<CompanyId> correlatedCompanyIds,
                               String profileCreateTimestamp) {
@@ -233,20 +576,20 @@ public class DatabaseMigrationService {
     String methodName = "insertDocuments";
     if (nonNull(companyDetailsMap) && !companyDetailsMap.isEmpty() && !correlatedCompanyIds.isEmpty()) {
       if (correlatedCompanyIds.size() != companyDetailsMap.size() && nonNull(companyProfileEvent)) {
-        OneSupplierLogFacade.info(appName, profileId, correlationId, className, methodName,
+        OneSupplierLogFacade.info(appName, profileId, trackingCorrelationId, className, methodName,
           "Correlated company ids and company details not equal for :" + profileId + " trying to restore");
-        //identify which correlated ids are not there in company details
+        //identify which correlated ids are not there in company details map
         Set<CompanyId> companyIdsNotInProfile =
           correlatedCompanyIds.stream().filter(
             companyId -> !companyDetailsMap.containsKey(companyId.getValue())).collect(Collectors.toSet());
         restoreDetailsForMissingCompanyIds(companyIdsNotInProfile, companyProfileEvent, companyDetailsMap, profileId,
-          correlationId);
+          trackingCorrelationId);
         //remove those ids from correlated company ids
         correlatedCompanyIds = correlatedCompanyIds.stream().filter(
           id -> !companyDetailsMap.containsKey(id.getValue())).toList();
       }
       if (!companyDetailsMap.isEmpty() && !correlatedCompanyIds.isEmpty()) {
-        Optional<Profile> profile = profileRepository.fetchFullProfile(profileId);
+        Optional<Profile> profile = profileRepository.findByProfileId(profileId);
         List<UUID> alreadyMigratedProfileCorrelationIds = new ArrayList<>();
         if (profile.isEmpty()) {
           insertProfileAndDemographics(profileId, companyProfile, profileCreateTimestamp);
@@ -260,79 +603,87 @@ public class DatabaseMigrationService {
           companyId -> !finalAlreadyMigratedProfileCorrelationIds.contains(
             UUID.fromString(companyId.getValue()))).toList();
         correlatedCompanyIds.forEach(companyId -> {
-          //check if company id was inserted or not, if not proceed, otherwise ignore
-          insertProfileCompanyDemographicsAndPayment(profileId, companyProfileEvent, companyDetailsMap,
-            profileCreateTimestamp, companyId);
-          UUID profileCompanyDetailId = UUID.fromString(companyId.getValue());
-          CompanyDetails companyDetails = companyDetailsMap.get(String.valueOf(profileCompanyDetailId));
-          if (nonNull(companyDetails)) {
-            if (companyDetails.getCounterpartyCorrelationId() != null) {
-              CompanyId counterCompanyId = companyDetails.getCounterpartyCorrelationId();
-              String counterPartyCorrelationId = counterCompanyId.getValue();
-              String counterPartySourceName = String.valueOf(counterCompanyId.getSource());
-              MigrationResult counterpartyMigrationResult = couchbaseRepo
-                .getAliasDocument(counterPartyCorrelationId + counterPartySourceName);
-              if (nonNull(counterpartyMigrationResult)) {
-                CompanyAlias counterCompanyAlias = counterpartyMigrationResult.getBusinessProfile().getCompanyAlias();
-                if (counterCompanyAlias != null) {
-                  insertProfileCounterPartyDocument(
-                    UUID.fromString(counterCompanyAlias.getProfileId()),
-                    UUID.fromString(counterPartyCorrelationId),
-                    profileCompanyDetailId,
-                    counterPartySourceName,
-                    correlationId,
-                    companyProfileEvent
-                  );
-                }
-              }
-            } else if (companyProfile.getCounterpartyIds() != null && !companyProfile.getCounterpartyIds().isEmpty()) {
-              companyProfile.getCounterpartyIds()
-                .forEach((key, value) -> value.forEach(counterPartyId -> {
-                  String counterPartySourceName = counterPartyId.substring(36);
-                  if (counterPartySourceName.isEmpty()) {
-                    counterPartySourceName = companyDetails.getCreateSource().getSourceName();
-                  }
-                  MigrationResult counterpartyMigrationResult = couchbaseRepo.getAliasDocument(counterPartyId);
-                  if (counterpartyMigrationResult != null) {
-                    CompanyAlias counterCompanyAlias =
-                      counterpartyMigrationResult.getBusinessProfile().getCompanyAlias();
-                    if (counterCompanyAlias != null) {
-                      insertProfileCounterPartyDocument(
-                        UUID.fromString(counterCompanyAlias.getProfileId()),
-                        UUID.fromString(counterCompanyAlias.getProfileCorrelationId()),
-                        UUID.fromString(key.substring(0, 36)),
-                        counterPartySourceName,
-                        correlationId,
-                        companyProfileEvent
-                      );
-                    }
-                  }
-                }));
-            }
-          } else {
-            OneSupplierLogFacade.warn(appName, profileId, correlationId, className, methodName,
-              "Could not migrate company details: " + correlationId + "of document: " + profileId
-                + " due to missing company details");
-          }
+          migrateCompanyDetails(companyProfile, profileId, trackingCorrelationId, companyProfileEvent,
+            companyDetailsMap, profileCreateTimestamp, companyId, methodName);
         });
         if (!finalAlreadyMigratedProfileCorrelationIds.isEmpty()) {
           //migrated events only if not already migrated
           List<Event> filteredEvents = companyProfileEvent.getEvents().stream().filter(
             event ->
               event.getCompanyId().stream().noneMatch(
-                companyId -> companyId.getType().equals(SPFIdType.PROFILE_CORRELATION_ID.getIdType())
+                companyId -> companyId.getType().equals(PROFILE_CORRELATION_ID.getIdType())
                   && finalAlreadyMigratedProfileCorrelationIds.contains(UUID.fromString(companyId.getValue()))
               )).toList();
           companyProfileEvent.setEvents(filteredEvents);
         }
         insertEventDetails(profileId, companyProfileEvent, correlatedCompanyIds);
       } else {
-        OneSupplierLogFacade.warn(appName, profileId, correlationId, className, methodName,
+        OneSupplierLogFacade.warn(appName, profileId, trackingCorrelationId, className, methodName,
           "Could not migrate document:" + profileId + " due to missing company details");
       }
     } else {
-      OneSupplierLogFacade.warn(appName, profileId, correlationId, className, methodName,
+      OneSupplierLogFacade.warn(appName, profileId, trackingCorrelationId, className, methodName,
         "Could not migrate document:" + profileId + " due to missing company details");
+    }
+  }
+
+  public void migrateCompanyDetails(CompanyProfile companyProfile, UUID profileId, String trackingCorrelationId,
+                                    CompanyProfileEvent companyProfileEvent,
+                                    Map<String, CompanyDetails> companyDetailsMap, String profileCreateTimestamp,
+                                    CompanyId companyId, String methodName) {
+    //check if company id was inserted or not, if not proceed, otherwise ignore
+    insertProfileCompanyDemographicsAndPayment(profileId, companyProfileEvent, companyDetailsMap,
+      profileCreateTimestamp, companyId);
+    UUID profileCompanyDetailId = UUID.fromString(companyId.getValue());
+    CompanyDetails companyDetails = companyDetailsMap.get(String.valueOf(profileCompanyDetailId));
+    if (nonNull(companyDetails)) {
+      if (companyDetails.getCounterpartyCorrelationId() != null) {
+        CompanyId counterCompanyId = companyDetails.getCounterpartyCorrelationId();
+        String counterPartyCorrelationId = counterCompanyId.getValue();
+        String counterPartySourceName = String.valueOf(counterCompanyId.getSource());
+        MigrationResult counterpartyMigrationResult = couchbaseRepo
+          .getAliasDocument(counterPartyCorrelationId + counterPartySourceName);
+        if (nonNull(counterpartyMigrationResult)) {
+          CompanyAlias counterCompanyAlias = counterpartyMigrationResult.getBusinessProfile().getCompanyAlias();
+          if (counterCompanyAlias != null) {
+            insertProfileCounterPartyDocument(
+              UUID.fromString(counterCompanyAlias.getProfileId()),
+              UUID.fromString(counterPartyCorrelationId),
+              profileCompanyDetailId,
+              counterPartySourceName,
+              trackingCorrelationId,
+              companyProfileEvent
+            );
+          }
+        }
+      } else if (companyProfile.getCounterpartyIds() != null && !companyProfile.getCounterpartyIds().isEmpty()) {
+        companyProfile.getCounterpartyIds()
+          .forEach((key, value) -> value.forEach(counterPartyId -> {
+            String counterPartySourceName = counterPartyId.substring(36);
+            if (counterPartySourceName.isEmpty()) {
+              counterPartySourceName = companyDetails.getCreateSource().getSourceName();
+            }
+            MigrationResult counterpartyMigrationResult = couchbaseRepo.getAliasDocument(counterPartyId);
+            if (counterpartyMigrationResult != null) {
+              CompanyAlias counterCompanyAlias = counterpartyMigrationResult.getBusinessProfile()
+                .getCompanyAlias();
+              if (counterCompanyAlias != null) {
+                insertProfileCounterPartyDocument(
+                  UUID.fromString(counterCompanyAlias.getProfileId()),
+                  UUID.fromString(counterCompanyAlias.getProfileCorrelationId()),
+                  UUID.fromString(key.substring(0, 36)),
+                  counterPartySourceName,
+                  trackingCorrelationId,
+                  companyProfileEvent
+                );
+              }
+            }
+          }));
+      }
+    } else {
+      OneSupplierLogFacade.warn(appName, profileId, trackingCorrelationId, className, methodName,
+        "Could not migrate company details: " + trackingCorrelationId + "of document: " + profileId
+          + " due to missing company details");
     }
   }
 
@@ -398,7 +749,7 @@ public class DatabaseMigrationService {
       CompanyProfile companyProfile = migrationResult.getBusinessProfile().getCompanyProfile();
       CompanyProfileEvent companyProfileEvent = migrationResult.getBusinessProfile().getCompanyProfileEvent();
       Map<String, CompanyDetails> companyDetailsMap = companyProfile.getCompanyDetails();
-      Optional<Profile> profileOptional = profileRepository.fetchFullProfile(counterpartyProfileId);
+      Optional<Profile> profileOptional = profileRepository.findByProfileId(counterpartyProfileId);
 
       if (profileOptional.isEmpty()) {
         OneSupplierLogFacade.info(appName, counterpartyProfileId, correlationId, className, methodName,
@@ -432,7 +783,8 @@ public class DatabaseMigrationService {
             profileCompanyDetail -> profileCompanyDetail.getProfileCompanyDetailId().equals(
               counterpartyProfileCorrelationId));
         }
-        if (companyDetailsMap.isEmpty() || isNull(companyDetailsMap.get(counterpartyProfileCorrelationId.toString()))) {
+        if (companyDetailsMap.isEmpty() || isNull(
+          companyDetailsMap.get(counterpartyProfileCorrelationId.toString()))) {
           restoreCounterPartyCompanyDetails(counterpartyProfileId,
             counterpartyProfileCorrelationId,
             primaryProfileCorrelationId,
@@ -602,7 +954,7 @@ public class DatabaseMigrationService {
       correlatedCompanyIds.stream().filter(i ->
         i.getValue().equals(counterpartyProfileCorrelationId.toString())
       ).findFirst().orElse(new CompanyId(
-        SPFIdType.PROFILE_CORRELATION_ID.getIdType(),
+        PROFILE_CORRELATION_ID.getIdType(),
         counterpartyProfileCorrelationId.toString(),
         CompanySource.valueOf(counterPartySourceName),
         true
@@ -646,7 +998,7 @@ public class DatabaseMigrationService {
         correlatedCompanyIds.stream().filter(i ->
           i.getValue().equals(counterpartyProfileCorrelationId.toString())
         ).findFirst().orElse(new CompanyId(
-          SPFIdType.PROFILE_CORRELATION_ID.getIdType(),
+          PROFILE_CORRELATION_ID.getIdType(),
           counterpartyProfileCorrelationId.toString(),
           CompanySource.valueOf(counterPartySourceName),
           true
@@ -674,10 +1026,10 @@ public class DatabaseMigrationService {
   ) {
     List<Event> eventList =
       primaryPartyIds.stream()
-        .map(couchbaseRepo::getAliasDocument)
+        .map(id -> couchbaseRepo.getAliasDocument(id))
         .map(aliasDocMigrationResult -> aliasDocMigrationResult.getBusinessProfile().getCompanyAlias())
         .map(CompanyAlias::getProfileId)
-        .map(couchbaseRepo::getProfileDocumentById)
+        .map(profileId -> couchbaseRepo.getProfileDocumentById(profileId))
         .map(
           primaryPartyProfileMigrationResult ->
             primaryPartyProfileMigrationResult.getBusinessProfile().getCompanyProfileEvent().getEvents()
@@ -699,14 +1051,17 @@ public class DatabaseMigrationService {
       CounterpartyDetails counterpartyDetails = eventList.get(0).getCounterpartyDetails();
       Set<PaymentAccount> paymentAccounts = eventList.stream()
         .map(Event::getCounterpartyDetails)
+        .filter(Objects::nonNull)
         .map(CounterpartyDetails::getPaymentAccounts)
+        .filter(Objects::nonNull)
         .flatMap(Collection::stream)
         .collect(Collectors.toSet());
-      counterpartyDetails.setPaymentAccounts(paymentAccounts.stream().toList());
-      return Optional.of(counterpartyDetails);
-    } else {
-      return Optional.empty();
+      if (counterpartyDetails != null && !paymentAccounts.isEmpty()) {
+        counterpartyDetails.setPaymentAccounts(paymentAccounts.stream().toList());
+        return Optional.of(counterpartyDetails);
+      }
     }
+    return Optional.empty();
   }
 
   private void reconstructCounterpartyCompanyDetails(
@@ -803,6 +1158,7 @@ public class DatabaseMigrationService {
     profileRepository.save(profile);
   }
 
+  //TODO: pass this
   private void insertProfileCompany(CompanyId companyId, UUID profileId, UUID profileCompanyDetailId,
                                     String createTimestamp) {
     String value = companyId.getValue();
@@ -1115,13 +1471,13 @@ public class DatabaseMigrationService {
 
   private List<CompanyId> getCompanyIDListOfTypeProfileCorrelationId(List<CompanyId> companyIds) {
     return companyIds.stream()
-      .filter(companyId -> companyId.getType().equalsIgnoreCase(SPFIdType.PROFILE_CORRELATION_ID.getIdType()))
+      .filter(companyId -> companyId.getType().equalsIgnoreCase(PROFILE_CORRELATION_ID.getIdType()))
       .collect(Collectors.toList());
   }
 
   private List<CompanyId> getCompanyIDListOfNotProfileCorrelationIdType(List<CompanyId> companyIds) {
     return companyIds.stream()
-      .filter(companyId -> !companyId.getType().equalsIgnoreCase(SPFIdType.PROFILE_CORRELATION_ID.getIdType()))
+      .filter(companyId -> !companyId.getType().equalsIgnoreCase(PROFILE_CORRELATION_ID.getIdType()))
       .collect(Collectors.toList());
   }
 

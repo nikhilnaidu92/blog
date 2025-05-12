@@ -45,7 +45,6 @@ import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.Paymen
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.PaymentMethodDetails;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.VerificationMeta;
 import com.aexp.gcs.supplierprofile.profiledatamodel.domain.model.company.verification.VerificationDetail;
-import com.aexp.gcs.supplierprofile.scriptsupport.exception.AssertionValidationException;
 import com.aexp.gcs.supplierprofile.scriptsupport.model.BusinessProfile;
 import com.aexp.gcs.supplierprofile.scriptsupport.model.MigrationResult;
 import com.aexp.gcs.supplierprofile.scriptsupport.repository.CouchbaseRepo;
@@ -56,7 +55,6 @@ import lombok.RequiredArgsConstructor;
 import org.apache.commons.collections4.CollectionUtils;
 import org.assertj.core.util.Strings;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -71,18 +69,17 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
-import static com.aexp.gcs.supplierprofile.scriptsupport.constants.ScriptSupportConstants.CM11_TYPE;
-import static com.aexp.gcs.supplierprofile.scriptsupport.constants.ScriptSupportConstants.CM15_TYPE;
+import static com.aexp.gcs.supplierprofile.scriptsupport.model.Constants.CM11_TYPE;
+import static com.aexp.gcs.supplierprofile.scriptsupport.model.Constants.CM15_TYPE;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @Data
 @Service
-@Transactional
 @RequiredArgsConstructor
 public class MigratedDocumentValidationService {
   private final CouchbaseRepo couchbaseRepo;
-  private final ProfileRepository profileRepository;
   private final ProfileAcceptanceRepository profileAcceptanceRepository;
+  private final ProfileRepository profileRepository;
   private final ProfileCompanyDetailRepository profileCompanyDetailRepository;
   private final ProfileCompanyRepository profileCompanyRepository;
   private final ProfileContactRepository profileContactRepository;
@@ -99,14 +96,15 @@ public class MigratedDocumentValidationService {
     if (!profileIds.isEmpty()) {
       for (String id : profileIds) {
         UUID profileId = UUID.fromString(id);
-        Optional<Profile> profile = profileRepository.fetchFullProfile(profileId);
+        Optional<Profile> profile = profileRepository.findByProfileId(profileId);
         MigrationResult migrationResult = new MigrationResult();
         if (profile.isPresent()) {
-          Set<ProfileCompanyDetail> profileCompanyDetailList = profile.get().getProfileCompanyDetail();
-          Set<ProfileCompany> profileCompanyList = profile.get().getProfileCompanyList();
-          Set<ProfileContact> profileContactList = profile.get().getProfileContactList();
-          Set<ProfileDemographics> profileDemographicsList = profile.get().getProfileDemographics();
-          Set<ProfileEvent> profileEventList = profile.get().getProfileEventList();
+          List<ProfileCompanyDetail> profileCompanyDetailList = profileCompanyDetailRepository
+            .findByProfileId(profileId);
+          List<ProfileCompany> profileCompanyList = profileCompanyRepository.findByProfileId(profileId);
+          List<ProfileContact> profileContactList = profileContactRepository.findByProfileId(profileId);
+          List<ProfileDemographics> profileDemographicsList = profileDemographicsRepository.findByProfileId(profileId);
+          List<ProfileEvent> profileEventList = profileEventRepository.findByProfileId(profileId);
 
           migrationResult.setId(String.valueOf(profileId));
           migrationResult.setBusinessProfile(getBusinessProfile(profile.get(), profileCompanyDetailList,
@@ -134,13 +132,13 @@ public class MigratedDocumentValidationService {
     MigrationResult migrationResult = new MigrationResult();
     String errorMessage;
     try {
-      Optional<Profile> profile = profileRepository.fetchFullProfile(profileId);
+      Optional<Profile> profile = profileRepository.findByProfileId(profileId);
       if (profile.isPresent()) {
-        Set<ProfileCompanyDetail> profileCompanyDetailList = profile.get().getProfileCompanyDetail();
-        Set<ProfileCompany> profileCompanyList = profile.get().getProfileCompanyList();
-        Set<ProfileContact> profileContactList = profile.get().getProfileContactList();
-        Set<ProfileDemographics> profileDemographicsList = profile.get().getProfileDemographics();
-        Set<ProfileEvent> profileEventList = profile.get().getProfileEventList();
+        List<ProfileCompanyDetail> profileCompanyDetailList = profileCompanyDetailRepository.findByProfileId(profileId);
+        List<ProfileCompany> profileCompanyList = profileCompanyRepository.findByProfileId(profileId);
+        List<ProfileContact> profileContactList = profileContactRepository.findByProfileId(profileId);
+        List<ProfileDemographics> profileDemographicsList = profileDemographicsRepository.findByProfileId(profileId);
+        List<ProfileEvent> profileEventList = profileEventRepository.findByProfileId(profileId);
 
         migrationResult.setId(String.valueOf(profileId));
         migrationResult.setBusinessProfile(getBusinessProfile(profile.get(), profileCompanyDetailList,
@@ -156,7 +154,7 @@ public class MigratedDocumentValidationService {
       }
     } catch (AssertionError | Exception e) {
       errorMessage = "Assertion failed for:" + profileId + ", due to " + OneSupplierLogFacade.getShortTrace(e);
-      throw new AssertionValidationException(profileId, errorMessage);
+      OneSupplierLogFacade.error(appName, profileId, "correlationId", className, methodName, errorMessage);
     }
   }
 
@@ -320,11 +318,11 @@ public class MigratedDocumentValidationService {
       .containsAll(migratedCompanyIds);
   }
 
-  private BusinessProfile getBusinessProfile(Profile profile, Set<ProfileCompanyDetail> profileCompanyDetailList,
-                                             Set<ProfileCompany> profileCompanyList,
-                                             Set<ProfileContact> profileContactList,
-                                             Set<ProfileDemographics> profileDemographicsList,
-                                             Set<ProfileEvent> profileEventList)
+  private BusinessProfile getBusinessProfile(Profile profile, List<ProfileCompanyDetail> profileCompanyDetailList,
+                                             List<ProfileCompany> profileCompanyList,
+                                             List<ProfileContact> profileContactList,
+                                             List<ProfileDemographics> profileDemographicsList,
+                                             List<ProfileEvent> profileEventList)
     throws JsonProcessingException {
     Map<String, CompanyDetails> companyDetailsMap = new HashMap<>();
     CompanyProfile companyProfile = new CompanyProfile();
@@ -333,102 +331,157 @@ public class MigratedDocumentValidationService {
     UUID counterPartyProfileId;
     Set<String> value = new HashSet<>();
     CompanyAlias companyAlias = new CompanyAlias();
-    if (profileCompanyDetailList != null && !profileCompanyDetailList.isEmpty()) {
-      for (ProfileCompanyDetail profileCompanyDetail : profileCompanyDetailList) {
-        CompanyDetails companyDetails = new CompanyDetails();
-        if (profileCompanyDetail.getBusinessTypeText() != null) {
-          companyDetails.setBusinessType(BusinessType.valueOf(profileCompanyDetail.getBusinessTypeText()));
-        }
-        if (profileContactList != null && !profileContactList.isEmpty()) {
-          List<Contact> companyIdContactList = profileContactList.stream()
-            .filter(profileContact -> profileContact.getProfileCompanyDetailId() != null
-              && profileContact.getTypeTx() == null
-              && profileCompanyDetail.getProfileCompanyDetailId().equals(
-              profileContact.getProfileCompanyDetailId())
-            ).map(this::getContact)
-            .collect(Collectors.toList());
-          companyDetails.setContacts(companyIdContactList);
-        }
-        if (profileCompanyDetail.getOnboardingStatusDescription() != null) {
-          companyDetails.setOnboardingStatus(OnboardingStatus
-            .getOnboardingStatusByDescription(profileCompanyDetail.getOnboardingStatusDescription()).get());
-        }
-        companyDetails.setOnboardingStatusCode(profileCompanyDetail.getOnboardingStatusCode());
-        if (profileCompanyDetail.getCreateSourceText() != null) {
-          companyDetails.setCreateSource(CompanySource.valueOf(profileCompanyDetail.getCreateSourceText()));
-        }
-        companyDetails.setDeleteStatus(profileCompanyDetail.isDeleteStatusIndicator());
-        companyDetails.setCreateTime(String.valueOf(profileCompanyDetail.getCreateTimestamp()));
-        companyDetails.setSchemaVersion(profileCompanyDetail.getVersionNumber());
-        companyDetails.setCreateSource(CompanySource.valueOf(profileCompanyDetail.getCreateSourceText()));
-
-        List<ProfilePaymentAccount> profilePaymentAccountList = profilePaymentAccountRepository
-          .findByProfileCompanyDetailId(profileCompanyDetail.getProfileCompanyDetailId());
-        companyDetails.setPaymentAccounts(getPaymentAccounts(profilePaymentAccountList));
-
-        CompanyContact companyContact = new CompanyContact();
-        if (CollectionUtils.isNotEmpty(profileContactList)) {
-          profileContactList.stream().filter(profileContact -> profileContact.getProfileCompanyDetailId() != null
-              && profileContact.getTypeTx() != null
-              && profileCompanyDetail.getProfileCompanyDetailId().equals(
-              profileContact.getProfileCompanyDetailId()))
-            .forEach(profileContact -> {
-              if (profileContact.getTypeTx().equals("generic")) {
-                companyContact.setGenericContact(getGenericContact(profileContact));
-              }
-              if (profileContact.getTypeTx().equals("direct")) {
-                companyContact.setDirectContact(getDirectContact(profileContact));
-              }
-            });
-        }
-        if (profileDemographicsList != null && !profileDemographicsList.isEmpty()) {
-          for (ProfileDemographics companyDetailDemographics : profileDemographicsList) {
-            if (companyDetailDemographics.getProfileCompanyDetailId() != null
-              && companyDetailDemographics.getProfilePaymentAccountId() == null
-              && profileCompanyDetail.getProfileCompanyDetailId()
-              .equals(companyDetailDemographics.getProfileCompanyDetailId())) {
-              companyDetails.setDemographics(getDemographics(companyDetailDemographics, companyContact, null, null));
-            }
-          }
-        }
-        if (Objects.isNull(companyDetails.getDemographics())) {
-          companyDetails.setDemographics(new Demographics());
-        }
-
-        List<ProfileRelationship> profileRelationshipList = profileRelationshipRepository
-          .findByProfileCompanyDetailIdOrCounterProfileCompanyDetailsId(profileCompanyDetail
-            .getProfileCompanyDetailId());
-        if (!profileRelationshipList.isEmpty()) {
-          for (ProfileRelationship profileRelationship : profileRelationshipList) {
-            UUID correlationId = profileRelationship.getCounterProfileCompanyDetailsId();
-            Optional<ProfileCompanyDetail> counterProfileCompanyDetails = profileCompanyDetailRepository
-              .findByProfileCompanyDetailId(correlationId);
-            Optional<ProfileCompany> profileCompanyOptional = profileCompanyRepository
-              .findAllByProfileCompanyDetailIdAndProfileId(correlationId,
-                counterProfileCompanyDetails.get().getProfileId());
-            CompanyId companyId = new CompanyId();
-            companyId.setValue(String.valueOf(profileRelationship.getCounterProfileCompanyDetailsId()));
-            companyId.setSource(CompanySource.valueOf(profileRelationship.getCreateBySourceName()));
-            if (profileCompanyOptional.isPresent()) {
-              value.add(String.valueOf(profileCompanyOptional.get().getProfileCompanyDetailId())
-                + profileCompanyOptional.get().getSourceCode());
-              companyId.setFlag(profileCompanyOptional.get().isUniqueFlagIndicator());
-              companyId.setType(profileCompanyOptional.get().getTypeText());
-            }
-            companyDetails.setCounterpartyCorrelationId(companyId);
-
-            counterPartyProfileId = counterProfileCompanyDetails.get().getProfileId();
-            companyAlias.setProfileId(counterPartyProfileId.toString());
-            companyAlias.setSource(String.valueOf(profileCompanyOptional.get().getSourceCode()));
-            companyAlias.setProfileCorrelationId(String.valueOf(correlationId));
-            companyAlias.setIdType(profileCompanyOptional.get().getTypeText());
-            companyAliasList.add(companyAlias);
-            counterpartyIds.put(String.valueOf(profileRelationship.getProfileCompanyDetailId()), value);
-          }
-          value = new HashSet<>();
-        }
-        companyDetailsMap.put(profileCompanyDetail.getProfileCompanyDetailId().toString(), companyDetails);
+    for (ProfileCompanyDetail profileCompanyDetail : profileCompanyDetailList) {
+      CompanyDetails companyDetails = new CompanyDetails();
+      if (profileCompanyDetail.getBusinessTypeText() != null) {
+        companyDetails.setBusinessType(BusinessType.valueOf(profileCompanyDetail.getBusinessTypeText()));
       }
+      if (CollectionUtils.isNotEmpty(profileContactList)) {
+        List<Contact> companyIdContactList = profileContactList.stream()
+          .filter(profileContact -> profileContact.getProfileCompanyDetailId() != null
+            && profileContact.getTypeTx() == null
+            && profileCompanyDetail.getProfileCompanyDetailId().equals(
+            profileContact.getProfileCompanyDetailId())
+          ).map(this::getContact)
+          .collect(Collectors.toList());
+        companyDetails.setContacts(companyIdContactList);
+      }
+      if (profileCompanyDetail.getOnboardingStatusDescription() != null) {
+        companyDetails.setOnboardingStatus(OnboardingStatus
+          .getOnboardingStatusByDescription(profileCompanyDetail.getOnboardingStatusDescription()).get());
+      }
+      companyDetails.setOnboardingStatusCode(profileCompanyDetail.getOnboardingStatusCode());
+      if (profileCompanyDetail.getCreateSourceText() != null) {
+        companyDetails.setCreateSource(CompanySource.valueOf(profileCompanyDetail.getCreateSourceText()));
+      }
+      companyDetails.setDeleteStatus(profileCompanyDetail.isDeleteStatusIndicator());
+      companyDetails.setCreateTime(String.valueOf(profileCompanyDetail.getCreateTimestamp()));
+      companyDetails.setSchemaVersion(profileCompanyDetail.getVersionNumber());
+      companyDetails.setCreateSource(CompanySource.valueOf(profileCompanyDetail.getCreateSourceText()));
+
+      List<ProfilePaymentAccount> profilePaymentAccountList = profilePaymentAccountRepository
+        .findByProfileCompanyDetailId(profileCompanyDetail.getProfileCompanyDetailId());
+      companyDetails.setPaymentAccounts(getPaymentAccounts(profilePaymentAccountList));
+
+      CompanyContact companyContact = new CompanyContact();
+      if (CollectionUtils.isNotEmpty(profileContactList)) {
+        profileContactList.stream().filter(profileContact -> profileContact.getProfileCompanyDetailId() != null
+            && profileContact.getTypeTx() != null
+            && profileCompanyDetail.getProfileCompanyDetailId().equals(
+            profileContact.getProfileCompanyDetailId()))
+          .forEach(profileContact -> {
+            if (profileContact.getTypeTx().equals("generic")) {
+              companyContact.setGenericContact(getGenericContact(profileContact));
+            }
+            if (profileContact.getTypeTx().equals("direct")) {
+              companyContact.setDirectContact(getDirectContact(profileContact));
+            }
+          });
+      }
+      for (ProfileDemographics companyDetailDemographics : profileDemographicsList) {
+        if (companyDetailDemographics.getProfileCompanyDetailId() != null
+          && companyDetailDemographics.getProfilePaymentAccountId() == null
+          && profileCompanyDetail.getProfileCompanyDetailId()
+          .equals(companyDetailDemographics.getProfileCompanyDetailId())) {
+          companyDetails.setDemographics(getDemographics(companyDetailDemographics, companyContact, null, null));
+        }
+      }
+      if (Objects.isNull(companyDetails.getDemographics())) {
+        companyDetails.setDemographics(new Demographics());
+      }
+
+      /*Optional<ProfileRelationship> profileRelationshipOptional = profileRelationshipRepository
+        .findByProfileCompanyDetailId(profileCompanyDetail.getProfileCompanyDetailId());
+      if (profileRelationshipOptional.isEmpty()) {
+        profileRelationshipOptional = profileRelationshipRepository
+          .findByCounterProfileCompanyDetailsId(profileCompanyDetail.getProfileCompanyDetailId());
+        if (profileRelationshipOptional.isPresent()) {
+          ProfileRelationship profileRelationship = profileRelationshipOptional.get();
+          UUID profileCorrelationId = profileRelationship.getProfileCompanyDetailId();
+          UUID counterPartyProfileCorrelationId = profileRelationship.getCounterProfileCompanyDetailsId();
+          Optional<ProfileCompanyDetail> profileCompanyDetails = profileCompanyDetailRepository
+            .findByProfileCompanyDetailId(counterPartyProfileCorrelationId);
+          counterPartyProfileId = profileCompanyDetails.get().getProfileId();
+          Optional<ProfileCompany> profileCompanyOptional = profileCompanyRepository
+            .findAllByProfileCompanyDetailIdAndProfileId(counterPartyProfileCorrelationId, counterPartyProfileId);
+
+          CompanyId companyId = new CompanyId();
+          companyId.setValue(String.valueOf(profileCorrelationId));
+          companyId.setSource(CompanySource.valueOf(profileRelationship.getCreateBySourceName()));
+          if (profileCompanyOptional.isPresent()) {
+            value.add(profileRelationship.getProfileCompanyDetailId().toString()
+              + profileCompanyOptional.get().getSourceCode());
+            companyId.setFlag(profileCompanyOptional.get().isUniqueFlagIndicator());
+            companyId.setType(profileCompanyOptional.get().getTypeText());
+          }
+          companyDetails.setCounterpartyCorrelationId(companyId);
+
+          companyAlias.setProfileId(counterPartyProfileId.toString());
+          companyAlias.setSource(String.valueOf(profileCompanyOptional.get().getSourceCode()));
+          companyAlias.setProfileCorrelationId(String.valueOf(profileCorrelationId));
+          companyAlias.setIdType(profileCompanyOptional.get().getTypeText());
+          companyAliasList.add(companyAlias);
+          counterpartyIds.put(String.valueOf(profileRelationship.getCounterProfileCompanyDetailsId()), value);
+        }
+      } else {
+        ProfileRelationship profileRelationship = profileRelationshipOptional.get();
+        UUID counterPartyProfileCorrelationId = profileRelationship.getCounterProfileCompanyDetailsId();
+        Optional<ProfileCompanyDetail> counterProfileCompanyDetails = profileCompanyDetailRepository
+          .findByProfileCompanyDetailId(counterPartyProfileCorrelationId);
+        Optional<ProfileCompany> profileCompanyOptional = profileCompanyRepository
+          .findAllByProfileCompanyDetailIdAndProfileId(counterPartyProfileCorrelationId,
+            counterProfileCompanyDetails.get().getProfileId());
+        CompanyId companyId = new CompanyId();
+        companyId.setValue(String.valueOf(profileRelationship.getCounterProfileCompanyDetailsId()));
+        companyId.setSource(CompanySource.valueOf(profileRelationship.getCreateBySourceName()));
+        if (profileCompanyOptional.isPresent()) {
+          value.add(profileCompanyOptional.get().getValueText() + profileCompanyOptional.get().getSourceCode());
+          companyId.setFlag(profileCompanyOptional.get().isUniqueFlagIndicator());
+          companyId.setType(profileCompanyOptional.get().getTypeText());
+        }
+        companyDetails.setCounterpartyCorrelationId(companyId);
+
+        counterPartyProfileId = counterProfileCompanyDetails.get().getProfileId();
+        companyAlias.setProfileId(counterPartyProfileId.toString());
+        companyAlias.setSource(String.valueOf(profileCompanyOptional.get().getSourceCode()));
+        companyAlias.setProfileCorrelationId(String.valueOf(counterPartyProfileCorrelationId));
+        companyAlias.setIdType(profileCompanyOptional.get().getTypeText());
+        companyAliasList.add(companyAlias);
+        counterpartyIds.put(String.valueOf(profileRelationship.getProfileCompanyDetailId()), value);
+      }*/
+
+      List<ProfileRelationship> profileRelationshipList = profileRelationshipRepository
+        .findByProfileCompanyDetailIdOrCounterProfileCompanyDetailsId(profileCompanyDetail.getProfileCompanyDetailId());
+      if (!profileRelationshipList.isEmpty()) {
+        for (ProfileRelationship profileRelationship : profileRelationshipList) {
+          UUID correlationId = profileRelationship.getCounterProfileCompanyDetailsId();
+          Optional<ProfileCompanyDetail> counterProfileCompanyDetails = profileCompanyDetailRepository
+            .findByProfileCompanyDetailId(correlationId);
+          Optional<ProfileCompany> profileCompanyOptional = profileCompanyRepository
+            .findAllByProfileCompanyDetailIdAndProfileId(correlationId,
+              counterProfileCompanyDetails.get().getProfileId());
+          CompanyId companyId = new CompanyId();
+          companyId.setValue(String.valueOf(profileRelationship.getCounterProfileCompanyDetailsId()));
+          companyId.setSource(CompanySource.valueOf(profileRelationship.getCreateBySourceName()));
+          if (profileCompanyOptional.isPresent()) {
+            value.add(String.valueOf(profileCompanyOptional.get().getProfileCompanyDetailId())
+              + profileCompanyOptional.get().getSourceCode());
+            companyId.setFlag(profileCompanyOptional.get().isUniqueFlagIndicator());
+            companyId.setType(profileCompanyOptional.get().getTypeText());
+          }
+          companyDetails.setCounterpartyCorrelationId(companyId);
+
+          counterPartyProfileId = counterProfileCompanyDetails.get().getProfileId();
+          companyAlias.setProfileId(counterPartyProfileId.toString());
+          companyAlias.setSource(String.valueOf(profileCompanyOptional.get().getSourceCode()));
+          companyAlias.setProfileCorrelationId(String.valueOf(correlationId));
+          companyAlias.setIdType(profileCompanyOptional.get().getTypeText());
+          companyAliasList.add(companyAlias);
+          counterpartyIds.put(String.valueOf(profileRelationship.getProfileCompanyDetailId()), value);
+        }
+        value = new HashSet<>();
+      }
+      companyDetailsMap.put(profileCompanyDetail.getProfileCompanyDetailId().toString(), companyDetails);
     }
     companyProfile.setCounterpartyIds(counterpartyIds);
     companyProfile.setCompanyDetails(companyDetailsMap);
@@ -448,13 +501,11 @@ public class MigratedDocumentValidationService {
     companyProfile.setProfileId(String.valueOf(profile.getProfileId()));
     companyProfile.setCompanyId(getCompanyIdsList(profileCompanyList));
 
-    if (profileDemographicsList != null && !profileDemographicsList.isEmpty()) {
-      for (ProfileDemographics profileDemographics : profileDemographicsList) {
-        if (profileDemographics.getProfileCompanyDetailId() == null
-          && profileDemographics.getProfilePaymentAccountId() == null) {
-          companyProfile.setDemographics(getDemographics(profileDemographics, profileLevelContact,
-            profile.getConfidenceCode(), profile.getConfidenceSourceTx()));
-        }
+    for (ProfileDemographics profileDemographics : profileDemographicsList) {
+      if (profileDemographics.getProfileCompanyDetailId() == null
+        && profileDemographics.getProfilePaymentAccountId() == null) {
+        companyProfile.setDemographics(getDemographics(profileDemographics, profileLevelContact,
+          profile.getConfidenceCode(), profile.getConfidenceSourceTx()));
       }
     }
 
@@ -465,11 +516,9 @@ public class MigratedDocumentValidationService {
     /* Set company profile event */
     CompanyProfileEvent companyProfileEvent = new CompanyProfileEvent();
     List<Event> events = new ArrayList<>();
-    if (profileEventList != null && !profileEventList.isEmpty()) {
-      for (ProfileEvent profileEvent : profileEventList) {
-        Event event = CouchbasejsonUtils.convertJsonToJava(profileEvent.getEventJsonData(), Event.class);
-        events.add(event);
-      }
+    for (ProfileEvent profileEvent : profileEventList) {
+      Event event = CouchbasejsonUtils.convertJsonToJava(profileEvent.getEventJsonData(), Event.class);
+      events.add(event);
     }
     companyProfileEvent.setDocumentId(String.valueOf(profile.getProfileId()));
     companyProfileEvent.setEvents(events);
@@ -520,11 +569,11 @@ public class MigratedDocumentValidationService {
       }
       if (profilePaymentAccount.getTransactionId() != null) {
         VerificationMeta verificationMeta = VerificationMeta.builder()
-          .transactionId(profilePaymentAccount.getTransactionId())
-          .ipAddress(profilePaymentAccount.getIpAddressExtensionText())
-          .uploadedBy(profilePaymentAccount.getUploadedByName())
-          .uploadedType(profilePaymentAccount.getUploadTypeText())
-          .build();
+            .transactionId(profilePaymentAccount.getTransactionId())
+            .ipAddress(profilePaymentAccount.getIpAddressExtensionText())
+            .uploadedBy(profilePaymentAccount.getUploadedByName())
+            .uploadedType(profilePaymentAccount.getUploadTypeText())
+            .build();
         paymentAccount.setVerificationMeta(verificationMeta);
       }
       paymentAccount.setProfilePaymentReferenceId(profilePaymentAccount.getReferenceId());
@@ -533,17 +582,15 @@ public class MigratedDocumentValidationService {
     return paymentAccountList;
   }
 
-  private List<CompanyId> getCompanyIdsList(Set<ProfileCompany> profileCompanyList) {
+  private List<CompanyId> getCompanyIdsList(List<ProfileCompany> profileCompanyList) {
     List<CompanyId> companyIdList = new ArrayList<>();
-    if (profileCompanyList != null && !profileCompanyList.isEmpty()) {
-      for (ProfileCompany profileCompany : profileCompanyList) {
-        CompanyId companyId = new CompanyId();
-        companyId.setSource(profileCompany.getSourceCode());
-        companyId.setValue(profileCompany.getValueText());
-        companyId.setFlag(profileCompany.isUniqueFlagIndicator());
-        companyId.setType(profileCompany.getTypeText());
-        companyIdList.add(companyId);
-      }
+    for (ProfileCompany profileCompany : profileCompanyList) {
+      CompanyId companyId = new CompanyId();
+      companyId.setSource(profileCompany.getSourceCode());
+      companyId.setValue(profileCompany.getValueText());
+      companyId.setFlag(profileCompany.isUniqueFlagIndicator());
+      companyId.setType(profileCompany.getTypeText());
+      companyIdList.add(companyId);
     }
     return companyIdList;
   }
